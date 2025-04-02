@@ -41,8 +41,7 @@ public class AssetNode
 public class DependencyGraphTool : EditorWindow 
 {
     #region Node
-    private float nodeWidth = 180f;
-    private float nodeHeight = 40f;
+
     private Dictionary<string, AssetNode> assetNodes = new Dictionary<string, AssetNode>();
     private Dictionary<string, Rect> nodePositions = new Dictionary<string, Rect>();
     private HashSet<Tuple<string, string>> cyclicEdges = new HashSet<Tuple<string, string>>();
@@ -79,6 +78,9 @@ public class DependencyGraphTool : EditorWindow
     private int maxAnalysisDepth = 3; // 분석 최대 깊이
     #endregion
     
+    private CycleDetector cycleDetector = new CycleDetector();
+    private NodePositionCalculator nodePositionCalculator = new NodePositionCalculator();
+    private DependencyAnalyzer dependencyAnalyzer = new DependencyAnalyzer();
     private string selectedAsset;
 
     private Vector2 scrollPosition;
@@ -222,7 +224,7 @@ public class DependencyGraphTool : EditorWindow
             // 에셋 찾기 버튼
             if (GUILayout.Button("에셋 찾기", GUILayout.Height(20)))
             {
-                var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(selectedAsset);
+                var asset = AssetDatabase.LoadAssetAtPath<Object>(selectedAsset);
                 if (asset != null)
                 {
                     EditorGUIUtility.PingObject(asset);
@@ -356,9 +358,11 @@ public class DependencyGraphTool : EditorWindow
         else
         {
             // 분석 전이면 안내 메시지 표시
-            GUIStyle centeredStyle = new GUIStyle(GUI.skin.label);
-            centeredStyle.alignment = TextAnchor.MiddleCenter;
-            centeredStyle.fontSize = 14;
+            GUIStyle centeredStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontSize = 14
+            };
             GUI.Label(graphScrollArea, "왼쪽 패널에서 에셋을 선택하고 '선택한 에셋 분석' 버튼을 클릭하세요.", centeredStyle);
         }
 
@@ -409,7 +413,7 @@ public class DependencyGraphTool : EditorWindow
                 highlightedAsset = clickedAsset;
             
                 // Unity 에디터에서 에셋 찾아 하이라이트
-                var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(clickedAsset);
+                var asset = AssetDatabase.LoadAssetAtPath<Object>(clickedAsset);
                 if (asset != null)
                 {
                     EditorGUIUtility.PingObject(asset);
@@ -440,7 +444,7 @@ public class DependencyGraphTool : EditorWindow
             if (assetNodes.ContainsKey(assetPath) && assetNodes[assetPath].Depth > maxDepthToShow)
                 continue;
                 
-            Rect position = nodePositions[assetPath];
+            Rect pos = nodePositions[assetPath];
                     
             string fileName = System.IO.Path.GetFileName(assetPath);
             string fileExt = System.IO.Path.GetExtension(assetPath).ToLower();
@@ -505,11 +509,11 @@ public class DependencyGraphTool : EditorWindow
             }
             
             // 노드 그리기
-            DrawSingleNode(position, fileName, nodeType, nodeColor, isSelected || isHighlighted);
+            DrawSingleNode(pos, fileName, nodeType, nodeColor, isSelected || isHighlighted);
 
             // 깊이 정보 표시 (노드 오른쪽 아래에 작게 표시)
             GUI.Label(
-                new Rect(position.x + position.width - 25, position.y + position.height - 15, 20, 15),
+                new Rect(pos.x + pos.width - 25, pos.y + pos.height - 15, 20, 15),
                 $"D{depth}",
                 new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleRight }
             );
@@ -578,36 +582,25 @@ public class DependencyGraphTool : EditorWindow
                 string sourceAsset = sourceNode.Path;
                 
                 // 깊이 필터링
-                if (sourceNode.Depth > maxDepthToShow)
-                    continue;
+                if (sourceNode.Depth > maxDepthToShow) continue;
                     
-                if (!nodePositions.ContainsKey(sourceAsset))
-                    continue;
-                    
-                Rect sourceRect = nodePositions[sourceAsset];
-                
+                if (!nodePositions.TryGetValue(sourceAsset, out var sourceRect)) continue;
+
                 foreach (string targetAsset in sourceNode.Dependencies)
                 {
                     // 타겟 노드가 없으면 건너뛰기
-                    if (!assetNodes.ContainsKey(targetAsset))
-                        continue;
-                        
-                    AssetNode targetNode = assetNodes[targetAsset];
-                    
+                    if (!assetNodes.TryGetValue(targetAsset, out var targetNode)) continue;
+
                     // 깊이 필터링
-                    if (targetNode.Depth > maxDepthToShow)
-                        continue;
+                    if (targetNode.Depth > maxDepthToShow) continue;
                         
-                    if (sourceAsset == targetAsset || !nodePositions.ContainsKey(targetAsset))
-                        continue;
+                    if (sourceAsset == targetAsset || !nodePositions.ContainsKey(targetAsset)) continue;
                         
                     // 이미 그려진 연결은 건너뛰기
                     var connectionKey = new Tuple<string, string>(sourceAsset, targetAsset);
-                    if (drawnConnections.Contains(connectionKey))
-                        continue;
+                    if (!drawnConnections.Add(connectionKey)) continue;
                         
-                    drawnConnections.Add(connectionKey);
-                    
+
                     // 종속성 연결
                     Rect targetRect = nodePositions[targetAsset];
                     
@@ -666,8 +659,7 @@ public class DependencyGraphTool : EditorWindow
         analysisCompleted = false;
 
         // 루트 노드 생성
-        AssetNode rootNode = new AssetNode(selectedAsset);
-        rootNode.Depth = 0;
+        AssetNode rootNode = new AssetNode(selectedAsset) { Depth = 0 };
         assetNodes[selectedAsset] = rootNode;
 
         // 처리된 에셋을 추적하기 위한 집합
@@ -688,521 +680,20 @@ public class DependencyGraphTool : EditorWindow
     // 재귀적 종속성 분석 메서드 개선
     private void AnalyzeAssetRecursively(string assetPath, HashSet<string> processedAssets, int depth, int maxDepth = 5)
     {
-        // 재귀 깊이 제한 또는 이미 처리된 에셋이면 중단
-        if (depth >= maxDepth || processedAssets.Contains(assetPath))
-            return;
-        
-        // 현재 에셋의 노드 가져오기
-        AssetNode currentNode = assetNodes[assetPath];
-        
-        // 에셋 처리 표시
-        processedAssets.Add(assetPath);
-
-        // 에셋 타입에 따른 분석
-        string ext = System.IO.Path.GetExtension(assetPath).ToLower();
-        List<string> dependencies = new List<string>();
-
-        if (ext == ".cs")
-        {
-            // 스크립트 분석
-            dependencies = AnalyzeScript(assetPath);
-        }
-        else
-        {
-            // 일반 에셋 분석
-            dependencies = AnalyzeAsset(assetPath);
-        }
-
-        // 발견된 모든 종속성에 대해
-        foreach (string dependency in dependencies)
-        {
-            // 노드의 종속성 목록에 추가
-            if (!currentNode.Dependencies.Contains(dependency))
-            {
-                currentNode.Dependencies.Add(dependency);
-            }
-            
-            // 타겟 노드가 없으면 생성
-            if (!assetNodes.ContainsKey(dependency))
-            {
-                AssetNode dependencyNode = new AssetNode(dependency);
-                dependencyNode.Depth = depth + 1;
-                dependencyNode.Parent = currentNode;
-                assetNodes[dependency] = dependencyNode;
-                
-                // 부모-자식 관계 설정
-                currentNode.Children.Add(dependencyNode);
-            }
-            else
-            {
-                AssetNode existingNode = assetNodes[dependency];
-                
-                // 더 짧은 경로가 발견되면 깊이와 부모 업데이트
-                if (depth + 1 < existingNode.Depth)
-                {
-                    // 기존 부모에서 제거
-                    if (existingNode.Parent != null)
-                    {
-                        existingNode.Parent.Children.Remove(existingNode);
-                    }
-                    
-                    // 새 부모로 연결
-                    existingNode.Parent = currentNode;
-                    existingNode.Depth = depth + 1;
-                    
-                    // 부모의 자식 목록에 추가
-                    if (!currentNode.Children.Contains(existingNode))
-                    {
-                        currentNode.Children.Add(existingNode);
-                    }
-                }
-            }
-            
-            // 재귀적으로 종속성 분석
-            AnalyzeAssetRecursively(dependency, processedAssets, depth + 1, maxDepth);
-        }
-    }
-
-    // 에셋 분석 메서드는 그대로 유지하되, 참조 관계도 기록
-    private List<string> AnalyzeAsset(string assetPath)
-    {
-        List<string> result = new List<string>();
-    
-        // 스크립트, 프리팹, 에셋, 머티리얼만 분석
-        string[] allowedExtensions = { ".cs", ".prefab", ".asset"};
-    
-        string[] dependencies = AssetDatabase.GetDependencies(assetPath, false);
-    
-        foreach (string dep in dependencies)
-        {
-            string ext = System.IO.Path.GetExtension(dep).ToLower();
-        
-            // 허용된 확장자만 추가
-            if (allowedExtensions.Contains(ext) && 
-                dep != assetPath && 
-                !dep.StartsWith("Packages/") && 
-                !dep.StartsWith("Library/"))
-            {
-                result.Add(dep);
-            }
-        }
-    
-        return result;
-    }
-
-    private List<string> AnalyzeScript(string scriptPath)
-    {
-        List<string> result = new List<string>();
-        
-        try
-        {
-            // 스크립트에서 타입 가져오기
-            MonoScript script = AssetDatabase.LoadAssetAtPath<MonoScript>(scriptPath);
-            if (script == null) return result;
-            
-            Type scriptType = script.GetClass();
-            if (scriptType == null) 
-            {
-                return result;
-            }
-            
-            // 프로젝트 내 모든 C# 스크립트 가져오기
-            string[] allScriptGuids = AssetDatabase.FindAssets("t:MonoScript");
-            
-            foreach (string guid in allScriptGuids)
-            {
-                string path = AssetDatabase.GUIDToAssetPath(guid);
-                if (path == scriptPath || !path.EndsWith(".cs")) continue;
-                
-                MonoScript otherScript = AssetDatabase.LoadAssetAtPath<MonoScript>(path);
-                if (otherScript == null) continue;
-                
-                Type otherType = otherScript.GetClass();
-                if (otherType == null) continue;
-                
-                // 스크립트 타입 간의 참조 관계 확인
-                if (HasTypeReference(scriptType, otherType))
-                {
-                    result.Add(path);
-                }
-            }
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"어셈블리 분석 오류: {e.Message}");
-        }
-        
-        return result;
-    }
-
-    // 한 타입이 다른 타입을 참조하는지 확인
-    private bool HasTypeReference(Type sourceType, Type targetType)
-    {
-        try
-        {
-            string targetTypeName = targetType.Name;
-            
-            // 1. 상속 관계 확인
-            if (sourceType.BaseType != null &&
-                (sourceType.BaseType == targetType || sourceType.BaseType.Name == targetTypeName))
-            {
-                return true;
-            }
-                
-            // 2. 인터페이스 구현 확인
-            foreach (Type interfaceType in sourceType.GetInterfaces())
-            {
-                if (interfaceType == targetType || interfaceType.Name == targetTypeName)
-                {
-                    return true;
-                }
-            }
-            
-            // 3. 필드 타입 확인
-            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | 
-                                BindingFlags.Instance | BindingFlags.Static;
-                                
-            foreach (FieldInfo field in sourceType.GetFields(flags))
-            {
-                Type fieldType = field.FieldType;
-                
-                // 배열인 경우 요소 타입 확인
-                if (fieldType.IsArray && fieldType.GetElementType() == targetType)
-                {
-                    return true;
-                }
-                    
-                // 제네릭 타입인 경우 인자 타입 확인
-                if (fieldType.IsGenericType)
-                {
-                    foreach (Type argType in fieldType.GetGenericArguments())
-                    {
-                        if (argType == targetType || argType.Name == targetTypeName)
-                        {
-                            return true;
-                        }
-                    }
-                }
-                
-                // 직접 타입 비교
-                if (fieldType == targetType || fieldType.Name == targetTypeName)
-                {
-                    return true;
-                }
-            }
-            
-            // 4. 메서드 파라미터 및 반환 타입 확인
-            foreach (MethodInfo method in sourceType.GetMethods(flags))
-            {
-                // 반환 타입 확인
-                if (method.ReturnType == targetType || method.ReturnType.Name == targetTypeName)
-                {
-                    return true;
-                }
-                    
-                // 파라미터 타입 확인
-                foreach (ParameterInfo param in method.GetParameters())
-                {
-                    Type paramType = param.ParameterType;
-                    
-                    if (paramType == targetType || paramType.Name == targetTypeName)
-                    {
-                        return true;
-                    }
-                        
-                    // 제네릭 파라미터 확인
-                    if (paramType.IsGenericType)
-                    {
-                        foreach (Type argType in paramType.GetGenericArguments())
-                        {
-                            if (argType == targetType || argType.Name == targetTypeName)
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-            
-            return false;
-        }
-        catch
-        {
-            // 오류 발생 시 안전하게 처리
-            return false;
-        }
+        dependencyAnalyzer.AnalyzeAssetRecursively(assetNodes, assetPath, processedAssets, depth, maxDepth);
     }
 
     private void DetectCycles()
     {
         cyclicEdges.Clear();
-        HashSet<string> visited = new HashSet<string>();
-        HashSet<string> inStack = new HashSet<string>();
-        
-        // 모든 노드에 대해 순환 참조 검사
-        foreach (var node in assetNodes.Keys)
-        {
-            if (!visited.Contains(node))
-            {
-                DFSForCycleDetection(node, visited, inStack);
-            }
-        }
-    }
-    
-    private void DFSForCycleDetection(string node, HashSet<string> visited, HashSet<string> inStack)
-    {
-        visited.Add(node);
-        inStack.Add(node);
-        
-        foreach (var dep in assetNodes[node].Dependencies)
-        {
-            if (!visited.Contains(dep))
-            {
-                DFSForCycleDetection(dep, visited, inStack);
-            }
-            else if (inStack.Contains(dep))
-            {
-                // 사이클 발견
-                cyclicEdges.Add(new Tuple<string, string>(node, dep));
-                
-                // 사이클 관련 노드 표시
-                if (assetNodes.ContainsKey(node))
-                    assetNodes[node].InCycle = true;
-                if (assetNodes.ContainsKey(dep))
-                    assetNodes[dep].InCycle = true;
-            }
-        }
-        
-        inStack.Remove(node);
+        cycleDetector.DetectCycle(assetNodes, cyclicEdges);
     }
     
     // 360도 분포를 가진 개선된 노드 배치 메서드
     private void ArrangeNodesWithHierarchy()
     {
         nodePositions.Clear();
-        
-        // 가상 캔버스 중심점을 기준으로 좌표 계산
-        float centerX = canvasCenter.x;
-        float centerY = canvasCenter.y;
-        
-        // 1. 루트 노드 배치
-        if (!selectedAsset.IsNullOrEmpty() && assetNodes.ContainsKey(selectedAsset))
-        {
-            nodePositions[selectedAsset] = new Rect(
-                centerX - nodeWidth/2,
-                centerY - nodeHeight/2,
-                nodeWidth,
-                nodeHeight
-            );
-        }
-        
-        // 충돌 감지 및 방지를 위한 HashSet
-        HashSet<Rect> occupiedAreas = new HashSet<Rect>();
-        
-        // 이미 배치된 노드의 영역 추가
-        foreach (var rect in nodePositions.Values)
-        {
-            occupiedAreas.Add(rect);
-        }
-        
-        // 2. 깊이 1인 노드들을 360도로 균등 분포 (주요 방향성 설정)
-        var depth1Nodes = assetNodes.Values
-            .Where(node => node.Depth == 1)
-            .ToList();
-        
-        int totalDirections = Mathf.Max(8, depth1Nodes.Count); // 최소 8방향 보장
-        
-        // 각 노드가 담당할 방향 영역 할당
-        Dictionary<string, float> nodeBaseAngles = new Dictionary<string, float>();
-        
-        for (int i = 0; i < depth1Nodes.Count; i++)
-        {
-            AssetNode node = depth1Nodes[i];
-            
-            // 360도를 균등하게 분할
-            float angle = (2f * Mathf.PI * i) / totalDirections;
-            nodeBaseAngles[node.Path] = angle;
-            
-            // 초기 위치 계산
-            float radius = 350f; // 1단계 깊이 반지름
-            
-            float x = centerX + Mathf.Cos(angle) * radius - nodeWidth/2;
-            float y = centerY + Mathf.Sin(angle) * radius - nodeHeight/2;
-            
-            // 노드 배치
-            Rect newRect = new Rect(
-                Mathf.Max(0, x),
-                Mathf.Max(0, y),
-                nodeWidth,
-                nodeHeight
-            );
-            
-            // 충돌 검사 및 회피
-            while (IsOverlapping(newRect, occupiedAreas))
-            {
-                radius += 50f;
-                x = centerX + Mathf.Cos(angle) * radius - nodeWidth/2;
-                y = centerY + Mathf.Sin(angle) * radius - nodeHeight/2;
-                
-                newRect = new Rect(
-                    Mathf.Max(0, x),
-                    Mathf.Max(0, y),
-                    nodeWidth,
-                    nodeHeight
-                );
-            }
-            
-            nodePositions[node.Path] = newRect;
-            occupiedAreas.Add(newRect);
-        }
-        
-        // 3. 나머지 깊이의 노드들을 자신의 부모나 참조 노드의 방향으로 분포
-        int maxDepth = assetNodes.Values.Any() ? assetNodes.Values.Max(n => n.Depth) : 0;
-        
-        for (int depth = 2; depth <= maxDepth; depth++)
-        {
-            var nodesInDepth = assetNodes.Values
-                .Where(node => node.Depth == depth)
-                .ToList();
-            
-            // 부모별로 자식 노드들을 그룹화
-            var nodesByParent = nodesInDepth.GroupBy(n => n.Parent.Path).ToList();
-            
-            // 각 부모 노드에 대해 자식들을 분산 배치
-            foreach (var parentGroup in nodesByParent)
-            {
-                string parentPath = parentGroup.Key;
-                var childNodes = parentGroup.ToList();
-                int childCount = childNodes.Count;
-                
-                if (!nodePositions.ContainsKey(parentPath)) continue;
-                
-                AssetNode parentNode = assetNodes[parentPath];
-                Rect parentRect = nodePositions[parentPath];
-                Vector2 parentCenter = new Vector2(
-                    parentRect.x + parentRect.width/2,
-                    parentRect.y + parentRect.height/2
-                );
-                
-                // 성장 방향 결정 (부모-조부모 방향 사용)
-                float growthAngle = 0;
-                
-                if (parentNode.Parent != null && nodePositions.ContainsKey(parentNode.Parent.Path))
-                {
-                    Rect grandparentRect = nodePositions[parentNode.Parent.Path];
-                    Vector2 grandparentCenter = new Vector2(
-                        grandparentRect.x + grandparentRect.width/2,
-                        grandparentRect.y + grandparentRect.height/2
-                    );
-                    
-                    Vector2 growthDir = new Vector2(
-                        parentCenter.x - grandparentCenter.x,
-                        parentCenter.y - grandparentCenter.y
-                    );
-                    
-                    if (growthDir.magnitude > 1.0f)
-                    {
-                        growthAngle = Mathf.Atan2(growthDir.y, growthDir.x);
-                    }
-                }
-                
-                // 자식 노드 개수에 따른 배치 전략
-                float baseRadius = 60f + (depth * 120f);
-                float angleSpread;
-                
-                // 자식 수에 따라 분산 각도 조정
-                if (childCount <= 3)
-                {
-                    angleSpread = Mathf.PI / 6; // 30도 (±15도)
-                }
-                else if (childCount <= 6) 
-                {
-                    angleSpread = Mathf.PI / 4; // 45도 (±22.5도)
-                }
-                else
-                {
-                    angleSpread = Mathf.PI / 3; // 60도 (±30도)
-                }
-                
-                // 각 자식 노드 배치
-                for (int i = 0; i < childCount; i++)
-                {
-                    AssetNode childNode = childNodes[i];
-                    
-                    // 이미 배치된 노드는 건너뛰기
-                    if (nodePositions.ContainsKey(childNode.Path)) continue;
-                    
-                    // 자식 위치 계산 (부모로부터 일정 거리, 분산된 각도)
-                    float childAngle = growthAngle;
-                    
-                    if (childCount > 1)
-                    {
-                        // -1.0 ~ +1.0 범위로 정규화된 오프셋
-                        float normalizedOffset = (2.0f * i / (childCount - 1)) - 1.0f;
-                        childAngle += angleSpread * normalizedOffset;
-                    }
-                    
-                    // 충돌 회피를 위한 위치 시도
-                    bool positionFound = false;
-                    float radius = baseRadius;
-                    int attempts = 0;
-                    
-                    while (!positionFound && attempts < 12)
-                    {
-                        float x = parentCenter.x + Mathf.Cos(childAngle) * radius - nodeWidth/2;
-                        float y = parentCenter.y + Mathf.Sin(childAngle) * radius - nodeHeight/2;
-                        
-                        Rect newRect = new Rect(
-                            Mathf.Max(0, x),
-                            Mathf.Max(0, y),
-                            nodeWidth,
-                            nodeHeight
-                        );
-                        
-                        if (!IsOverlapping(newRect, occupiedAreas))
-                        {
-                            nodePositions[childNode.Path] = newRect;
-                            occupiedAreas.Add(newRect);
-                            positionFound = true;
-                        }
-                        else
-                        {
-                            attempts++;
-                            
-                            // 충돌 회피 전략 수정 - 각도와 거리 모두 조정
-                            if (attempts % 2 == 0)
-                            {
-                                // 거리 증가
-                                radius += 50f;
-                            }
-                            else
-                            {
-                                // 각도 미세 조정 (방향 번갈아가며)
-                                float angleAdjust = (Mathf.PI / 12) * (attempts % 4 == 1 ? 1 : -1);
-                                childAngle += angleAdjust;
-                            }
-                        }
-                    }
-                    
-                    // 위치를 찾지 못했다면 강제 배치
-                    if (!positionFound)
-                    {
-                        float x = parentCenter.x + Mathf.Cos(childAngle) * (baseRadius + 300f) - nodeWidth/2;
-                        float y = parentCenter.y + Mathf.Sin(childAngle) * (baseRadius + 300f) - nodeHeight/2;
-                        
-                        Rect newRect = new Rect(
-                            Mathf.Max(0, x),
-                            Mathf.Max(0, y),
-                            nodeWidth,
-                            nodeHeight
-                        );
-                        
-                        nodePositions[childNode.Path] = newRect;
-                        occupiedAreas.Add(newRect);
-                    }
-                }
-            }
-        }
+        nodePositionCalculator.ArrangeNodesWithHierarchy(nodePositions, canvasCenter, selectedAsset, assetNodes);
         
         // 초기 스크롤 위치 설정
         InitializeScrollPosition();
@@ -1218,8 +709,8 @@ public class DependencyGraphTool : EditorWindow
         
             // 가상 캔버스 중앙에 루트 노드 위치
             scrollPosition = new Vector2(
-                rootRect.x - (position.width - rightPanelRect.x - leftPanelWidth - panelSpacing) / 2 + nodeWidth / 2,
-                rootRect.y - (position.height - rightPanelRect.y) / 2 + nodeHeight / 2
+                rootRect.x - (position.width - rightPanelRect.x - leftPanelWidth - panelSpacing) / 2 + nodePositionCalculator.nodeWidth / 2,
+                rootRect.y - (position.height - rightPanelRect.y) / 2 + nodePositionCalculator.nodeHeight / 2
             );
         }
         else
@@ -1232,62 +723,41 @@ public class DependencyGraphTool : EditorWindow
         }
     }
     
-    private bool IsOverlapping(Rect rect, HashSet<Rect> existingRects)
-    {
-        foreach (var existingRect in existingRects)
-        {
-            // 여백을 추가하여 충분한 간격 보장
-            Rect expandedExisting = new Rect(
-                existingRect.x - 10,
-                existingRect.y - 10,
-                existingRect.width + 20,
-                existingRect.height + 20
-            );
-        
-            if (rect.Overlaps(expandedExisting))
-            {
-                return true;
-            }
-        }
-    
-        return false;
-    }
-    
-    private void DrawArrow(Vector2 position, Vector2 direction, float size, Color color)
+    private void DrawArrow(Vector2 pos, Vector2 direction, float size, Color color)
     {
         // 명확한 삼각형 화살표 그리기
-        Vector2 right = new Vector2(-direction.y, direction.x).normalized * size * 0.5f;
-        Vector2 tip = position;
-        Vector2 baseLeft = position - direction * size - right;
-        Vector2 baseRight = position - direction * size + right;
+        Vector2 right = new Vector2(-direction.y, direction.x).normalized * (size * 0.5f);
+        Vector2 tip = pos;
+        Vector2 baseLeft = pos - direction * size - right;
+        Vector2 baseRight = pos - direction * size + right;
 
         Handles.color = color;
         Handles.DrawAAConvexPolygon(new Vector3[] { tip, baseLeft, baseRight });
     }
     
     // DrawSingleNode 메서드 수정 - 노드 테두리 개선
-    private void DrawSingleNode(Rect position, string title, string type, Color color, bool isSelected = false)
+    private void DrawSingleNode(Rect pos, string nodeTitle, string type, Color color, bool isSelected = false)
     {
         // 파일 이름만 추출
-        string displayName = System.IO.Path.GetFileName(title);
+        string displayName = System.IO.Path.GetFileName(nodeTitle);
         bool isInCycle = cyclicEdges != null && 
                         cyclicEdges.Any(e => 
-                            e.Item1 == title || e.Item2 == title || 
+                            e.Item1 == nodeTitle || e.Item2 == nodeTitle || 
                             (System.IO.Path.GetFileName(e.Item1) == displayName || System.IO.Path.GetFileName(e.Item2) == displayName));
         
         // 그림자 효과
         GUI.color = new Color(0, 0, 0, 0.3f);
-        GUI.Box(new Rect(position.x + 3, position.y + 3, position.width, position.height), "", "flow node 0");
+        GUI.Box(new Rect(pos.x + 3, pos.y + 3, pos.width, pos.height), "", "flow node 0");
         GUI.color = Color.white;
 
         // 노드 배경
-        EditorGUI.DrawRect(position, color);
+        EditorGUI.DrawRect(pos, color);
 
         // 테두리 색상 선택
         Color borderColor;
         float borderWidth;
         
-        if (title == highlightedAsset)
+        if (nodeTitle == highlightedAsset)
         {
             // 하이라이트된 노드 - 노란색 굵은 테두리
             borderColor = Color.yellow;
@@ -1313,25 +783,26 @@ public class DependencyGraphTool : EditorWindow
         }
         
         // 위/아래 테두리
-        EditorGUI.DrawRect(new Rect(position.x, position.y - borderWidth, position.width, borderWidth), borderColor);
-        EditorGUI.DrawRect(new Rect(position.x, position.y + position.height, position.width, borderWidth), borderColor);
+        EditorGUI.DrawRect(new Rect(pos.x, pos.y - borderWidth, pos.width, borderWidth), borderColor);
+        EditorGUI.DrawRect(new Rect(pos.x, pos.y + pos.height, pos.width, borderWidth), borderColor);
         
         // 좌/우 테두리
-        EditorGUI.DrawRect(new Rect(position.x - borderWidth, position.y - borderWidth, borderWidth, position.height + borderWidth * 2), borderColor);
-        EditorGUI.DrawRect(new Rect(position.x + position.width, position.y - borderWidth, borderWidth, position.height + borderWidth * 2), borderColor);
+        EditorGUI.DrawRect(new Rect(pos.x - borderWidth, pos.y - borderWidth, borderWidth, pos.height + borderWidth * 2), borderColor);
+        EditorGUI.DrawRect(new Rect(pos.x + pos.width, pos.y - borderWidth, borderWidth, pos.height + borderWidth * 2), borderColor);
         
         // 제목 줄 배경 (약간 어두운 그라데이션)
-        EditorGUI.DrawRect(new Rect(position.x, position.y, position.width, 22), new Color(0, 0, 0, 0.1f));
+        EditorGUI.DrawRect(new Rect(pos.x, pos.y, pos.width, 22), new Color(0, 0, 0, 0.1f));
 
         // 노드 내용 - 파일 이름과 타입 표시
-        GUIStyle titleStyle = new GUIStyle(EditorStyles.whiteBoldLabel);
-        titleStyle.alignment = TextAnchor.MiddleLeft;
-        GUI.Label(new Rect(position.x + 8, position.y, position.width - 16, 22), displayName, titleStyle);
+        GUIStyle titleStyle = new GUIStyle(EditorStyles.whiteBoldLabel) { alignment = TextAnchor.MiddleLeft };
+        GUI.Label(new Rect(pos.x + 8, pos.y, pos.width - 16, 22), displayName, titleStyle);
         
-        GUIStyle typeStyle = new GUIStyle(EditorStyles.whiteLabel);
-        typeStyle.alignment = TextAnchor.MiddleLeft;
-        typeStyle.fontSize = 10;
-        GUI.Label(new Rect(position.x + 8, position.y + 24, position.width - 16, 20), type, typeStyle);
+        GUIStyle typeStyle = new GUIStyle(EditorStyles.whiteLabel) 
+        {
+            alignment = TextAnchor.MiddleLeft,
+            fontSize = 10
+        };
+        GUI.Label(new Rect(pos.x + 8, pos.y + 24, pos.width - 16, 20), type, typeStyle);
     }
 
     // 연결 수 계산 메서드
